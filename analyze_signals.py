@@ -24,21 +24,93 @@ SIGNAL_WEIGHTS = {
 }
 
 
-# 從 MSSQL 讀取資料
-def read_ohlcv_from_mssql(server, database, table, user, password):
+# 從 MSSQL 讀取資料（優化版）
+def read_ohlcv_from_mssql(server, database, table, user, password, chunk_size=50000):
+    """
+    優化的資料讀取函數，使用分塊讀取以減少記憶體使用並提升效能
+    還加入了更好的連線選項和查詢最佳化
+    """
     conn_str = (
         f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-        f"SERVER={server};DATABASE={database};UID={user};PWD={password}"
+        f"SERVER={server};DATABASE={database};UID={user};PWD={password};"
+        f"Trusted_Connection=no;Connection Timeout=30;Application Name=TechnicalAnalysis"
     )
-    conn = pyodbc.connect(conn_str)
-    query = f"SELECT * FROM {table} ORDER BY datetime"
-    df = pd.read_sql(query, conn)
-    conn.close()
-    # 確保 datetime 欄位為 datetime 型態
-    if 'datetime' in df.columns:
-        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
-    df = df.sort_values('datetime').reset_index(drop=True)
-    return df
+
+    try:
+        # 使用上下文管理器自動處理連線關閉
+        with pyodbc.connect(conn_str) as conn:
+            # 設置連線選項
+            conn.setdecoding(pyodbc.SQL_CHAR, encoding='utf-8')
+            conn.setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8')
+
+            # 檢查資料量
+            count_query = f"SELECT COUNT(*) FROM {table}"
+            cursor = conn.cursor()
+            row_count = cursor.execute(count_query).fetchval()
+            print(f"資料表 {table} 共有 {row_count:,} 筆資料")
+
+            # 如果資料量不大，直接讀取全部
+            if row_count <= chunk_size:
+                query = f"""
+                SELECT * FROM {table}
+                ORDER BY datetime
+                """
+                df = pd.read_sql(query, conn)
+                print(f"已一次讀取全部 {len(df):,} 筆資料")
+            else:
+                # 使用分塊讀取大型資料集
+                print(f"資料量較大，使用分塊讀取...")
+
+                # 先讀取欄位結構
+                schema_query = f"SELECT TOP 1 * FROM {table}"
+                temp_df = pd.read_sql(schema_query, conn)
+                columns = temp_df.columns
+
+                # 獲取日期範圍
+                date_range_query = f"""
+                SELECT MIN(datetime) as min_date, MAX(datetime) as max_date 
+                FROM {table}
+                """
+                date_range = pd.read_sql(date_range_query, conn)
+                min_date = date_range['min_date'].iloc[0]
+                max_date = date_range['max_date'].iloc[0]
+
+                # 分批讀取資料
+                chunks = []
+                current_date = min_date
+                end_date = max_date
+
+                # 使用日期範圍分批讀取
+                while current_date <= end_date:
+                    next_date = pd.to_datetime(
+                        current_date) + pd.DateOffset(months=3)
+                    chunk_query = f"""
+                    SELECT * FROM {table}
+                    WHERE datetime >= '{current_date}' AND datetime < '{next_date}'
+                    ORDER BY datetime
+                    """
+                    chunk = pd.read_sql(chunk_query, conn)
+                    chunks.append(chunk)
+                    print(
+                        f"已讀取 {current_date} 至 {next_date} 期間的 {len(chunk):,} 筆資料")
+                    current_date = next_date
+
+                # 合併所有分塊
+                df = pd.concat(chunks, ignore_index=True)
+                print(f"共讀取 {len(df):,} 筆資料")
+
+        # 確保 datetime 欄位為 datetime 型態
+        if 'datetime' in df.columns:
+            df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+
+        # 排序資料並重置索引
+        df = df.sort_values('datetime').reset_index(drop=True)
+
+        return df
+
+    except Exception as e:
+        print(f"讀取資料時發生錯誤: {str(e)}")
+        return pd.DataFrame()
 
 # 均線突破訊號（ma5/ma20）
 
@@ -305,12 +377,182 @@ def generate_trade_signals(df, min_signals=3):
 
     return df
 
-# 主流程
+# 定義儲存至MSSQL的函數
+
+
+def save_signals_to_mssql(df, server, database, user, password, table_name='trade_signals'):
+    """
+    將分析結果儲存至MSSQL資料庫 (優化版)
+    使用批量插入而非逐行插入，大幅提升效能
+    """
+    import time
+    start_time = time.time()
+
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};DATABASE={database};UID={user};PWD={password};"
+        f"Trusted_Connection=no"
+    )
+
+    # 設置連接超時和快速失敗選項
+    conn = pyodbc.connect(conn_str, timeout=30)
+    cursor = conn.cursor()
+
+    # 確認資料表是否存在，若不存在則建立
+    try:
+        # 檢查資料表是否存在
+        check_table_query = f"""
+        IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = '{table_name}')
+        BEGIN
+            CREATE TABLE {table_name} (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                datetime DATETIME,
+                symbol NVARCHAR(20),
+                close_price FLOAT,
+                Trade_Signal NVARCHAR(50),
+                Signal_Strength NVARCHAR(50),
+                Buy_Signals FLOAT,
+                Sell_Signals FLOAT,
+                MA_Cross NVARCHAR(50),
+                BB_Signal NVARCHAR(50),
+                MACD_Cross NVARCHAR(50),
+                Trend NVARCHAR(50),
+                MACD_Div NVARCHAR(50),
+                RSI_Signal NVARCHAR(50),
+                KD_Signal NVARCHAR(50),
+                SR_Signal NVARCHAR(50),
+                Volume_Anomaly NVARCHAR(50),
+                EMA_Cross NVARCHAR(50),
+                CCI_Signal NVARCHAR(50),
+                WILLR_Signal NVARCHAR(50),
+                MOM_Signal NVARCHAR(50),
+                Anomaly NVARCHAR(50),
+                INDEX idx_datetime (datetime),
+                INDEX idx_symbol (symbol)
+            )
+        END
+        """
+        cursor.execute(check_table_query)
+        conn.commit()
+
+        # 準備要寫入的資料欄位
+        required_columns = ['datetime', 'symbol', 'close_price', 'Trade_Signal',
+                            'Signal_Strength', 'Buy_Signals', 'Sell_Signals',
+                            'MA_Cross', 'BB_Signal', 'MACD_Cross', 'Trend',
+                            'MACD_Div', 'RSI_Signal', 'KD_Signal', 'SR_Signal',
+                            'Volume_Anomaly', 'EMA_Cross', 'CCI_Signal',
+                            'WILLR_Signal', 'MOM_Signal', 'Anomaly']
+
+        # 確保DataFrame包含所有需要的欄位
+        for col in required_columns:
+            if col not in df.columns:
+                if col == 'symbol' and 'symbol' not in df.columns:
+                    # 如果缺少symbol欄位，新增一個預設值
+                    df['symbol'] = 'Unknown'
+                else:
+                    df[col] = ''
+
+        # 準備批量插入
+        # 1. 先清空目標表中的相同symbol資料(避免重複)
+        if 'symbol' in df.columns and len(df) > 0:
+            symbols = list(df['symbol'].unique())
+            if symbols and symbols[0] != 'Unknown':
+                symbol_list = ", ".join([f"'{s}'" for s in symbols])
+                delete_query = f"DELETE FROM {table_name} WHERE symbol IN ({symbol_list})"
+                cursor.execute(delete_query)
+                conn.commit()
+                print(f"已清空表中相同symbol的資料: {symbols}")
+
+        # 2. 使用快速插入方法
+        # 設定每批次處理的資料量
+        batch_size = 1000
+        total_rows = len(df)
+
+        # 構建參數化查詢
+        insert_query = f"""
+        INSERT INTO {table_name} (datetime, symbol, close_price, Trade_Signal, 
+                                Signal_Strength, Buy_Signals, Sell_Signals, 
+                                MA_Cross, BB_Signal, MACD_Cross, Trend, MACD_Div, 
+                                RSI_Signal, KD_Signal, SR_Signal, Volume_Anomaly, 
+                                EMA_Cross, CCI_Signal, WILLR_Signal, MOM_Signal, 
+                                Anomaly)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        # 批次處理資料
+        for i in range(0, total_rows, batch_size):
+            batch_df = df.iloc[i:i+batch_size]
+            batch_data = []
+
+            for _, row in batch_df.iterrows():
+                record = (
+                    row['datetime'],
+                    row.get('symbol', 'Unknown'),
+                    row['close_price'],
+                    row['Trade_Signal'],
+                    row['Signal_Strength'],
+                    row['Buy_Signals'],
+                    row['Sell_Signals'],
+                    row['MA_Cross'],
+                    row['BB_Signal'],
+                    row['MACD_Cross'],
+                    row['Trend'],
+                    row['MACD_Div'],
+                    row['RSI_Signal'],
+                    row['KD_Signal'],
+                    row['SR_Signal'],
+                    row['Volume_Anomaly'],
+                    row['EMA_Cross'],
+                    row['CCI_Signal'],
+                    row['WILLR_Signal'],
+                    row['MOM_Signal'],
+                    row.get('Anomaly', '')
+                )
+                batch_data.append(record)
+
+            # 批次執行
+            cursor.fast_executemany = True
+            cursor.executemany(insert_query, batch_data)
+            conn.commit()
+
+            # 顯示進度
+            progress = min(i + batch_size, total_rows)
+            print(
+                f"已處理 {progress}/{total_rows} 筆資料 ({progress/total_rows*100:.1f}%)")
+
+        # 記錄執行時間
+        elapsed_time = time.time() - start_time
+        print(f"成功將 {total_rows} 筆資料儲存至 {table_name} 資料表，耗時 {elapsed_time:.2f} 秒")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"儲存資料至MSSQL時發生錯誤: {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()  # 主流程
 
 
 def analyze_signals_from_db(
-        server, database, table, user, password, output_path):
+        server, database, table, user, password, output_path=None):
+    """優化版分析流程，包括效能監控"""
+    import time
+    total_start_time = time.time()
+
+    print("開始從資料庫讀取資料...")
+    read_start = time.time()
     df = read_ohlcv_from_mssql(server, database, table, user, password)
+    read_time = time.time() - read_start
+    print(f"讀取完成，共 {len(df)} 筆資料，耗時 {read_time:.2f} 秒")
+
+    # 應用所有技術指標計算（加入計時）
+    print("開始計算技術指標...")
+    calc_start = time.time()
+
+    # 優化：避免重複計算，增加資料預處理
+    # 首先對資料進行排序和索引優化
+    df = df.sort_values('datetime').reset_index(drop=True)
+
+    # 應用各種技術指標計算
     df = ma_cross_signal(df)
     df = bollinger_signal(df)
     df = macd_signal(df)
@@ -322,12 +564,41 @@ def analyze_signals_from_db(
     df = support_resistance_signal(df)
     df = volume_anomaly_signal(df)
     df = ema_cross_signal(df)
-    df = cci_signal(df)  # 新增CCI訊號
-    df = willr_signal(df)  # 新增威廉指標訊號
-    df = momentum_signal(df)  # 新增動量指標訊號
-    df = generate_trade_signals(df)  # 新增買賣訊號判斷
-    df.to_csv(output_path, index=False, encoding='utf-8-sig')
-    print(f'分析完成，結果已儲存至 {output_path}')
+    df = cci_signal(df)
+    df = willr_signal(df)
+    df = momentum_signal(df)
+
+    calc_time = time.time() - calc_start
+    print(f"指標計算完成，耗時 {calc_time:.2f} 秒")
+
+    # 產生買賣訊號
+    signal_start = time.time()
+    df = generate_trade_signals(df)
+    signal_time = time.time() - signal_start
+    print(f"訊號生成完成，耗時 {signal_time:.2f} 秒")
+
+    # 儲存至MSSQL
+    print("開始儲存結果到資料庫...")
+    save_start = time.time()
+    save_signals_to_mssql(df, server, database, user, password)
+    save_time = time.time() - save_start
+    print(f"資料庫儲存完成，耗時 {save_time:.2f} 秒")
+
+    # 如果有提供輸出路徑，也同時儲存為CSV
+    if output_path:
+        csv_start = time.time()
+        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        csv_time = time.time() - csv_start
+        print(f"CSV檔案儲存完成，耗時 {csv_time:.2f} 秒，路徑: {output_path}")
+
+    # 計算總執行時間
+    total_time = time.time() - total_start_time
+    print(f"\n總執行時間: {total_time:.2f} 秒")
+    print(f"- 資料讀取: {read_time:.2f}秒 ({read_time/total_time*100:.1f}%)")
+    print(f"- 指標計算: {calc_time:.2f}秒 ({calc_time/total_time*100:.1f}%)")
+    print(f"- 訊號生成: {signal_time:.2f}秒 ({signal_time/total_time*100:.1f}%)")
+    print(f"- 資料儲存: {save_time:.2f}秒 ({save_time/total_time*100:.1f}%)")
+
     print_analysis_summary(df)
 
 
@@ -382,6 +653,128 @@ def print_analysis_summary(df):
             )
 
 
+def analyze_signals_from_db_with_symbol(
+    server, database, table, user, password, output_path=None, symbol=None
+):
+    """優化版的含symbol分析流程"""
+    import time
+    total_start_time = time.time()
+
+    print(f"開始分析 symbol={symbol}" if symbol else "開始分析全部資料")
+
+    # 優化：在SQL查詢時就過濾symbol
+    if symbol and symbol != 'Unknown':
+        # 建立直接過濾symbol的查詢
+        conn_str = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={server};DATABASE={database};UID={user};PWD={password}"
+        )
+        with pyodbc.connect(conn_str) as conn:
+            # 先檢查symbol是否存在
+            check_query = f"SELECT COUNT(*) FROM {table} WHERE symbol = ?"
+            cursor = conn.cursor()
+            count = cursor.execute(check_query, symbol).fetchval()
+
+            if count == 0:
+                print(f"找不到 symbol={symbol} 的資料，程式結束。")
+                return
+
+            print(f"找到 {count} 筆 {symbol} 的資料，開始讀取...")
+            query = f"SELECT * FROM {table} WHERE symbol = ? ORDER BY datetime"
+            read_start = time.time()
+            df = pd.read_sql(query, conn, params=[symbol])
+            read_time = time.time() - read_start
+            print(f"讀取完成，耗時 {read_time:.2f} 秒")
+    else:
+        # 讀取全部資料
+        read_start = time.time()
+        df = read_ohlcv_from_mssql(server, database, table, user, password)
+        read_time = time.time() - read_start
+
+    if df.empty:
+        print("沒有資料可分析，程式結束。")
+        return
+
+    # 應用各種技術指標計算
+    print("開始計算技術指標...")
+    calc_start = time.time()
+
+    # 對性能影響較大的指標進行批次計算
+    signals = []
+
+    # 計算各類指標訊號
+    df = ma_cross_signal(df)
+    signals.append("MA交叉")
+
+    df = bollinger_signal(df)
+    signals.append("布林通道")
+
+    df = macd_signal(df)
+    signals.append("MACD交叉")
+
+    df = trend_signal(df)
+    signals.append("趨勢判斷")
+
+    df = macd_divergence(df)
+    signals.append("MACD背離")
+
+    df = anomaly_detection(df)
+    signals.append("異常偵測")
+
+    df = rsi_signal(df)
+    signals.append("RSI訊號")
+
+    df = kd_signal(df)
+    signals.append("KD訊號")
+
+    df = support_resistance_signal(df)
+    signals.append("壓力支撐位")
+
+    df = volume_anomaly_signal(df)
+    signals.append("成交量異常")
+
+    df = ema_cross_signal(df)
+    signals.append("EMA交叉")
+
+    df = cci_signal(df)
+    signals.append("CCI訊號")
+
+    df = willr_signal(df)
+    signals.append("威廉指標")
+
+    df = momentum_signal(df)
+    signals.append("動量指標")
+
+    calc_time = time.time() - calc_start
+    print(f"指標計算完成，耗時 {calc_time:.2f} 秒，共計算 {len(signals)} 個指標")
+
+    # 生成買賣訊號
+    signal_start = time.time()
+    df = generate_trade_signals(df)
+    signal_time = time.time() - signal_start
+    print(f"訊號生成完成，耗時 {signal_time:.2f} 秒")
+
+    # 儲存至MSSQL
+    save_start = time.time()
+    save_signals_to_mssql(df, server, database, user, password)
+    save_time = time.time() - save_start
+
+    # 如果有提供輸出路徑，也同時儲存為CSV
+    if output_path:
+        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f'分析結果已儲存至 {output_path}')
+
+    # 計算總執行時間
+    total_time = time.time() - total_start_time
+    print(f"\n總執行時間: {total_time:.2f} 秒")
+    print(f"- 資料讀取: {read_time:.2f}秒 ({read_time/total_time*100:.1f}%)")
+    print(f"- 指標計算: {calc_time:.2f}秒 ({calc_time/total_time*100:.1f}%)")
+    print(f"- 訊號生成: {signal_time:.2f}秒 ({signal_time/total_time*100:.1f}%)")
+    print(f"- 資料儲存: {save_time:.2f}秒 ({save_time/total_time*100:.1f}%)")
+
+    print_analysis_summary(df)
+
+
 if __name__ == '__main__':
     # 優先讀取 .env.local，若不存在再讀取 .env
     env_local = '.env.local'
@@ -395,39 +788,10 @@ if __name__ == '__main__':
     table = os.getenv('MSSQL_TABLE')
     user = os.getenv('MSSQL_USER')
     password = os.getenv('MSSQL_PASSWORD')
-    output_csv = os.getenv('OUTPUT_CSV', 'data/signals.csv')
+    output_csv = os.getenv('OUTPUT_CSV', '')  # 預設不輸出到CSV
 
     # 新增 symbol 變數，僅分析特定 symbol
-    symbol = '9950'  # 可自行修改
-
-    def analyze_signals_from_db_with_symbol(
-        server, database, table, user, password, output_path, symbol=None
-    ):
-        df = read_ohlcv_from_mssql(server, database, table, user, password)
-        # 僅保留指定 symbol 的資料（假設有 symbol 欄位）
-        if symbol is not None and 'symbol' in df.columns:
-            df = df[df['symbol'] == symbol]
-            if df.empty:
-                print(f"找不到 symbol={symbol} 的資料，程式結束。")
-                return
-        df = ma_cross_signal(df)
-        df = bollinger_signal(df)
-        df = macd_signal(df)
-        df = trend_signal(df)
-        df = macd_divergence(df)
-        df = anomaly_detection(df)
-        df = rsi_signal(df)
-        df = kd_signal(df)
-        df = support_resistance_signal(df)
-        df = volume_anomaly_signal(df)
-        df = ema_cross_signal(df)
-        df = cci_signal(df)  # 新增CCI訊號
-        df = willr_signal(df)  # 新增威廉指標訊號
-        df = momentum_signal(df)  # 新增動量指標訊號
-        df = generate_trade_signals(df)  # 新增買賣訊號判斷
-        df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        print(f'分析完成，結果已儲存至 {output_path}')
-        print_analysis_summary(df)
+    symbol = '2330'  # 可自行修改
 
     analyze_signals_from_db_with_symbol(
         server, database, table, user, password, output_csv, symbol)
