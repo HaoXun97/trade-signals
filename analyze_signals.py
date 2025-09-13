@@ -25,7 +25,9 @@ SIGNAL_WEIGHTS = {
 
 
 # 從 MSSQL 讀取資料（優化版）
-def read_ohlcv_from_mssql(server, database, table, user, password, chunk_size=50000):
+def read_ohlcv_from_mssql(
+    server, database, table, user, password, chunk_size=50000
+):
     """
     優化的資料讀取函數，使用分塊讀取以減少記憶體使用並提升效能
     還加入了更好的連線選項和查詢最佳化
@@ -33,7 +35,8 @@ def read_ohlcv_from_mssql(server, database, table, user, password, chunk_size=50
     conn_str = (
         f"DRIVER={{ODBC Driver 17 for SQL Server}};"
         f"SERVER={server};DATABASE={database};UID={user};PWD={password};"
-        f"Trusted_Connection=no;Connection Timeout=30;Application Name=TechnicalAnalysis"
+        f"Trusted_Connection=no;Connection Timeout=30;"
+        f"Application Name=TechnicalAnalysis"
     )
 
     try:
@@ -59,16 +62,11 @@ def read_ohlcv_from_mssql(server, database, table, user, password, chunk_size=50
                 print(f"已一次讀取全部 {len(df):,} 筆資料")
             else:
                 # 使用分塊讀取大型資料集
-                print(f"資料量較大，使用分塊讀取...")
-
-                # 先讀取欄位結構
-                schema_query = f"SELECT TOP 1 * FROM {table}"
-                temp_df = pd.read_sql(schema_query, conn)
-                columns = temp_df.columns
+                print("資料量較大，使用分塊讀取...")
 
                 # 獲取日期範圍
                 date_range_query = f"""
-                SELECT MIN(datetime) as min_date, MAX(datetime) as max_date 
+                SELECT MIN(datetime) as min_date, MAX(datetime) as max_date
                 FROM {table}
                 """
                 date_range = pd.read_sql(date_range_query, conn)
@@ -84,15 +82,20 @@ def read_ohlcv_from_mssql(server, database, table, user, password, chunk_size=50
                 while current_date <= end_date:
                     next_date = pd.to_datetime(
                         current_date) + pd.DateOffset(months=3)
-                    chunk_query = f"""
-                    SELECT * FROM {table}
-                    WHERE datetime >= '{current_date}' AND datetime < '{next_date}'
-                    ORDER BY datetime
-                    """
+                    chunk_query = (
+                        f"""
+                        SELECT * FROM {table}
+                        WHERE datetime >= '{current_date}'
+                        AND datetime < '{next_date}'
+                        ORDER BY datetime
+                        """
+                    )
                     chunk = pd.read_sql(chunk_query, conn)
                     chunks.append(chunk)
                     print(
-                        f"已讀取 {current_date} 至 {next_date} 期間的 {len(chunk):,} 筆資料")
+                        f"已讀取 {current_date} 至 {next_date} 期間的 "
+                        f"{len(chunk):,} 筆資料"
+                    )
                     current_date = next_date
 
                 # 合併所有分塊
@@ -380,7 +383,8 @@ def generate_trade_signals(df, min_signals=3):
 # 定義儲存至MSSQL的函數
 
 
-def save_signals_to_mssql(df, server, database, user, password, table_name='trade_signals'):
+def save_signals_to_mssql(df, server, database,
+                          user, password, table_name='trade_signals'):
     """
     將分析結果儲存至MSSQL資料庫 (優化版)
     使用批量插入而非逐行插入，大幅提升效能
@@ -436,7 +440,8 @@ def save_signals_to_mssql(df, server, database, user, password, table_name='trad
         conn.commit()
 
         # 準備要寫入的資料欄位
-        required_columns = ['datetime', 'symbol', 'close_price', 'Trade_Signal',
+        required_columns = ['datetime', 'symbol', 'close_price',
+                            'Trade_Signal',
                             'Signal_Strength', 'Buy_Signals', 'Sell_Signals',
                             'MA_Cross', 'BB_Signal', 'MACD_Cross', 'Trend',
                             'MACD_Div', 'RSI_Signal', 'KD_Signal', 'SR_Signal',
@@ -452,16 +457,26 @@ def save_signals_to_mssql(df, server, database, user, password, table_name='trad
                 else:
                     df[col] = ''
 
-        # 準備批量插入
-        # 1. 先清空目標表中的相同symbol資料(避免重複)
+        # 準備批量插入，採用智能更新而非全部清空
+        # 1. 只更新當前分析的symbol資料，不影響其他symbol
         if 'symbol' in df.columns and len(df) > 0:
             symbols = list(df['symbol'].unique())
             if symbols and symbols[0] != 'Unknown':
-                symbol_list = ", ".join([f"'{s}'" for s in symbols])
-                delete_query = f"DELETE FROM {table_name} WHERE symbol IN ({symbol_list})"
-                cursor.execute(delete_query)
+                # 獲取資料的日期範圍，只刪除這個範圍內的資料
+                min_date = df['datetime'].min()
+                max_date = df['datetime'].max()
+
+                for symbol in symbols:
+                    # 對每個symbol，只刪除相同日期範圍的資料
+                    delete_query = f"""
+                    DELETE FROM {table_name} 
+                    WHERE symbol = '{symbol}' 
+                    AND datetime >= '{min_date}' AND datetime <= '{max_date}'
+                    """
+                    cursor.execute(delete_query)
+
                 conn.commit()
-                print(f"已清空表中相同symbol的資料: {symbols}")
+                print(f"已更新 {symbols} 在 {min_date} 到 {max_date} 期間的資料")
 
         # 2. 使用快速插入方法
         # 設定每批次處理的資料量
@@ -470,12 +485,14 @@ def save_signals_to_mssql(df, server, database, user, password, table_name='trad
 
         # 構建參數化查詢
         insert_query = f"""
-        INSERT INTO {table_name} (datetime, symbol, close_price, Trade_Signal, 
-                                Signal_Strength, Buy_Signals, Sell_Signals, 
-                                MA_Cross, BB_Signal, MACD_Cross, Trend, MACD_Div, 
-                                RSI_Signal, KD_Signal, SR_Signal, Volume_Anomaly, 
-                                EMA_Cross, CCI_Signal, WILLR_Signal, MOM_Signal, 
-                                Anomaly)
+        INSERT INTO {table_name} (datetime, symbol, close_price, Trade_Signal,
+                                Signal_Strength, Buy_Signals, Sell_Signals,
+                                MA_Cross, BB_Signal, MACD_Cross,
+                                Trend, MACD_Div,
+                                RSI_Signal, KD_Signal, SR_Signal,
+                                Volume_Anomaly,
+                                EMA_Cross, CCI_Signal, WILLR_Signal,
+                                MOM_Signal, Anomaly)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
 
@@ -518,11 +535,13 @@ def save_signals_to_mssql(df, server, database, user, password, table_name='trad
             # 顯示進度
             progress = min(i + batch_size, total_rows)
             print(
-                f"已處理 {progress}/{total_rows} 筆資料 ({progress/total_rows*100:.1f}%)")
+                f"已處理 {progress}/{total_rows} 筆資料 "
+                f"({progress/total_rows*100:.1f}%)")
 
         # 記錄執行時間
         elapsed_time = time.time() - start_time
-        print(f"成功將 {total_rows} 筆資料儲存至 {table_name} 資料表，耗時 {elapsed_time:.2f} 秒")
+        print(f"成功將 {total_rows} 筆資料儲存至 {table_name} 資料表，"
+              f"耗時 {elapsed_time:.2f} 秒")
 
     except Exception as e:
         conn.rollback()
@@ -791,7 +810,7 @@ if __name__ == '__main__':
     output_csv = os.getenv('OUTPUT_CSV', '')  # 預設不輸出到CSV
 
     # 新增 symbol 變數，僅分析特定 symbol
-    symbol = '2330'  # 可自行修改
+    symbol = '2317'  # 可自行修改
 
     analyze_signals_from_db_with_symbol(
         server, database, table, user, password, output_csv, symbol)
