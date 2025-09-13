@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
-from scipy.stats import zscore
 
 # 訊號權重配置
 SIGNAL_WEIGHTS = {
@@ -22,8 +21,14 @@ SIGNAL_WEIGHTS = {
 
 
 def read_ohlcv(csv_path):
-    df = pd.read_csv(csv_path, encoding='utf-8')
-    df['datetime'] = pd.to_datetime(df['datetime'])
+    # 直接解析日期可以加快且更穩定地處理 datetime 欄位
+    try:
+        df = pd.read_csv(csv_path, encoding='utf-8', parse_dates=['datetime'])
+    except Exception:
+        # 若檔案沒有 utf-8 或沒有 datetime 欄位，退回到更寬鬆的讀法
+        df = pd.read_csv(csv_path, encoding='utf-8', low_memory=False)
+        if 'datetime' in df.columns:
+            df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
     df = df.sort_values('datetime').reset_index(drop=True)
     return df
 
@@ -72,28 +77,46 @@ def trend_signal(df):
 
 
 def macd_divergence(df, lookback=10):
+    # 向量化：比較當前價格/ dif 與前 lookback 期間的 min/max（不包含當前）
+    df = df.copy()
     df['MACD_Div'] = ''
-    for i in range(lookback, len(df)):
-        price_min = df['close_price'][i-lookback:i].min()
-        price_max = df['close_price'][i-lookback:i].max()
-        macd_min = df['dif'][i-lookback:i].min()
-        macd_max = df['dif'][i-lookback:i].max()
-        # 底背離
-        if df['close_price'][i] < price_min and df['dif'][i] > macd_min:
-            df.at[i, 'MACD_Div'] = '底背離'
-        # 頂背離
-        if df['close_price'][i] > price_max and df['dif'][i] < macd_max:
-            df.at[i, 'MACD_Div'] = '頂背離'
+    # 使用 shift(1) 讓滾動區間不包含當前列
+    price_shift = df['close_price'].shift(1)
+    dif_shift = df['dif'].shift(1)
+    price_min = price_shift.rolling(
+        window=lookback, min_periods=lookback
+    ).min()
+    price_max = price_shift.rolling(
+        window=lookback, min_periods=lookback
+    ).max()
+    macd_min = dif_shift.rolling(
+        window=lookback, min_periods=lookback
+    ).min()
+    macd_max = dif_shift.rolling(
+        window=lookback, min_periods=lookback
+    ).max()
+
+    cond_bottom = (df['close_price'] < price_min) & (df['dif'] > macd_min)
+    cond_top = (df['close_price'] > price_max) & (df['dif'] < macd_max)
+
+    df.loc[cond_bottom, 'MACD_Div'] = '底背離'
+    df.loc[cond_top, 'MACD_Div'] = '頂背離'
     return df
 
 # 異常偵測（K線異常波動）
 
 
 def anomaly_detection(df, window=20, threshold=3):
+    # 使用滾動平均與標準差計算 z-score，避免對整個序列套用 scipy.zscore
+    df = df.copy()
     df['Return'] = df['close_price'].pct_change()
-    df['ZScore'] = zscore(df['Return'].fillna(
-        0).rolling(window).mean().fillna(0))
+    roll_mean = df['Return'].rolling(window=window, min_periods=window).mean()
+    roll_std = df['Return'].rolling(window=window, min_periods=window).std()
+    df['ZScore'] = (df['Return'] - roll_mean) / roll_std
+    df['ZScore'] = df['ZScore'].replace([np.inf, -np.inf], np.nan).fillna(0)
     df['Anomaly'] = np.where(abs(df['ZScore']) > threshold, 'Anomaly', '')
+    # 移除臨時欄位以保持輸出乾淨
+    df.drop(columns=['Return', 'ZScore'], inplace=True, errors='ignore')
     return df
 
 # RSI 訊號
@@ -139,9 +162,10 @@ def support_resistance_signal(df):
 
 
 def volume_anomaly_signal(df, window=20, threshold=1.5):
-    df['vol_ma'] = df['volume'].rolling(window).mean()
-    df['Volume_Anomaly'] = np.where(
-        df['volume'] > df['vol_ma'] * threshold, '量能異常', '')
+    df = df.copy()
+    vol_ma = df['volume'].rolling(window=window, min_periods=1).mean()
+    cond = df['volume'] > vol_ma * threshold
+    df['Volume_Anomaly'] = np.where(cond, '量能異常', '')
     return df
 
 # EMA訊號（ema12/ema26交叉）
@@ -261,15 +285,15 @@ def generate_trade_signals(df, min_signals=3):
     df.loc[strong_sell, 'Trade_Signal'] = '強烈賣出'
     df.loc[sell, 'Trade_Signal'] = '賣出'
 
-    # 修正訊號強度計算
-    for idx in df[strong_buy].index:
-        df.at[idx, 'Signal_Strength'] = f'多頭{df.at[idx, "Buy_Signals"]:.1f}分'
-    for idx in df[buy].index:
-        df.at[idx, 'Signal_Strength'] = f'多頭{df.at[idx, "Buy_Signals"]:.1f}分'
-    for idx in df[strong_sell].index:
-        df.at[idx, 'Signal_Strength'] = f'空頭{df.at[idx, "Sell_Signals"]:.1f}分'
-    for idx in df[sell].index:
-        df.at[idx, 'Signal_Strength'] = f'空頭{df.at[idx, "Sell_Signals"]:.1f}分'
+    # 向量化設定訊號強度字串，避免逐筆迴圈
+    df.loc[df['Trade_Signal'].isin(['買入', '強烈買入']), 'Signal_Strength'] = (
+        '多頭' + df.loc[df['Trade_Signal'].isin(['買入', '強烈買入']), 'Buy_Signals']
+        .map(lambda v: f'{v:.1f}分')
+    )
+    df.loc[df['Trade_Signal'].isin(['賣出', '強烈賣出']), 'Signal_Strength'] = (
+        '空頭' + df.loc[df['Trade_Signal'].isin(['賣出', '強烈賣出']), 'Sell_Signals']
+        .map(lambda v: f'{v:.1f}分')
+    )
 
     return df
 
