@@ -795,6 +795,7 @@ def analyze_signals_from_db_with_symbol(
 
 
 if __name__ == '__main__':
+    import sys
     # 優先讀取 .env.local，若不存在再讀取 .env
     env_local = '.env.local'
     if os.path.exists(env_local):
@@ -809,8 +810,15 @@ if __name__ == '__main__':
     password = os.getenv('MSSQL_PASSWORD')
     output_csv = os.getenv('OUTPUT_CSV', '')  # 預設不輸出到CSV
 
-    # 新增 symbol 變數，僅分析特定 symbol
-    symbol = '2317'  # 可自行修改
+    # 預設 symbol
+    default_symbol = '2317'
+    # 若有命令列參數則用該 symbol，否則用預設值
+    if len(sys.argv) > 1:
+        symbol = sys.argv[1]
+        print(f"使用命令列參數 symbol: {symbol}")
+    else:
+        symbol = default_symbol
+        print(f"未指定 symbol，使用預設值: {symbol}")
 
     analyze_signals_from_db_with_symbol(
         server, database, table, user, password, output_csv, symbol)
