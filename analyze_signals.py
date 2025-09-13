@@ -395,6 +395,39 @@ if __name__ == '__main__':
     table = os.getenv('MSSQL_TABLE')
     user = os.getenv('MSSQL_USER')
     password = os.getenv('MSSQL_PASSWORD')
-    output_csv = os.getenv('OUTPUT_CSV', 'data/2330_signals.csv')
-    analyze_signals_from_db(server, database, table,
-                            user, password, output_csv)
+    output_csv = os.getenv('OUTPUT_CSV', 'data/signals.csv')
+
+    # 新增 symbol 變數，僅分析特定 symbol
+    symbol = '9950'  # 可自行修改
+
+    def analyze_signals_from_db_with_symbol(
+        server, database, table, user, password, output_path, symbol=None
+    ):
+        df = read_ohlcv_from_mssql(server, database, table, user, password)
+        # 僅保留指定 symbol 的資料（假設有 symbol 欄位）
+        if symbol is not None and 'symbol' in df.columns:
+            df = df[df['symbol'] == symbol]
+            if df.empty:
+                print(f"找不到 symbol={symbol} 的資料，程式結束。")
+                return
+        df = ma_cross_signal(df)
+        df = bollinger_signal(df)
+        df = macd_signal(df)
+        df = trend_signal(df)
+        df = macd_divergence(df)
+        df = anomaly_detection(df)
+        df = rsi_signal(df)
+        df = kd_signal(df)
+        df = support_resistance_signal(df)
+        df = volume_anomaly_signal(df)
+        df = ema_cross_signal(df)
+        df = cci_signal(df)  # 新增CCI訊號
+        df = willr_signal(df)  # 新增威廉指標訊號
+        df = momentum_signal(df)  # 新增動量指標訊號
+        df = generate_trade_signals(df)  # 新增買賣訊號判斷
+        df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f'分析完成，結果已儲存至 {output_path}')
+        print_analysis_summary(df)
+
+    analyze_signals_from_db_with_symbol(
+        server, database, table, user, password, output_csv, symbol)
