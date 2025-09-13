@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
+
 import pandas as pd
 import numpy as np
+import pyodbc
+import os
+from dotenv import load_dotenv
 
 # 訊號權重配置
 SIGNAL_WEIGHTS = {
@@ -20,15 +24,19 @@ SIGNAL_WEIGHTS = {
 }
 
 
-def read_ohlcv(csv_path):
-    # 直接解析日期可以加快且更穩定地處理 datetime 欄位
-    try:
-        df = pd.read_csv(csv_path, encoding='utf-8', parse_dates=['datetime'])
-    except Exception:
-        # 若檔案沒有 utf-8 或沒有 datetime 欄位，退回到更寬鬆的讀法
-        df = pd.read_csv(csv_path, encoding='utf-8', low_memory=False)
-        if 'datetime' in df.columns:
-            df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+# 從 MSSQL 讀取資料
+def read_ohlcv_from_mssql(server, database, table, user, password):
+    conn_str = (
+        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+        f"SERVER={server};DATABASE={database};UID={user};PWD={password}"
+    )
+    conn = pyodbc.connect(conn_str)
+    query = f"SELECT * FROM {table} ORDER BY datetime"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    # 確保 datetime 欄位為 datetime 型態
+    if 'datetime' in df.columns:
+        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
     df = df.sort_values('datetime').reset_index(drop=True)
     return df
 
@@ -300,8 +308,9 @@ def generate_trade_signals(df, min_signals=3):
 # 主流程
 
 
-def analyze_signals(csv_path, output_path):
-    df = read_ohlcv(csv_path)
+def analyze_signals_from_db(
+        server, database, table, user, password, output_path):
+    df = read_ohlcv_from_mssql(server, database, table, user, password)
     df = ma_cross_signal(df)
     df = bollinger_signal(df)
     df = macd_signal(df)
@@ -319,8 +328,6 @@ def analyze_signals(csv_path, output_path):
     df = generate_trade_signals(df)  # 新增買賣訊號判斷
     df.to_csv(output_path, index=False, encoding='utf-8-sig')
     print(f'分析完成，結果已儲存至 {output_path}')
-
-    # 顯示詳細統計資訊
     print_analysis_summary(df)
 
 
@@ -376,7 +383,18 @@ def print_analysis_summary(df):
 
 
 if __name__ == '__main__':
-    # 請將此路徑改為你的CSV檔案路徑
-    input_csv = 'data/2330.csv'
-    output_csv = 'data/2330_signals.csv'
-    analyze_signals(input_csv, output_csv)
+    # 優先讀取 .env.local，若不存在再讀取 .env
+    env_local = '.env.local'
+    if os.path.exists(env_local):
+        load_dotenv(env_local, override=True)
+    else:
+        load_dotenv()
+    # 從環境變數取得 MSSQL 連線參數
+    server = os.getenv('MSSQL_SERVER')
+    database = os.getenv('MSSQL_DATABASE')
+    table = os.getenv('MSSQL_TABLE')
+    user = os.getenv('MSSQL_USER')
+    password = os.getenv('MSSQL_PASSWORD')
+    output_csv = os.getenv('OUTPUT_CSV', 'data/2330_signals.csv')
+    analyze_signals_from_db(server, database, table,
+                            user, password, output_csv)
