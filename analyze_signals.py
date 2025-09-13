@@ -469,8 +469,8 @@ def save_signals_to_mssql(df, server, database,
                 for symbol in symbols:
                     # 對每個symbol，只刪除相同日期範圍的資料
                     delete_query = f"""
-                    DELETE FROM {table_name} 
-                    WHERE symbol = '{symbol}' 
+                    DELETE FROM {table_name}
+                    WHERE symbol = '{symbol}'
                     AND datetime >= '{min_date}' AND datetime <= '{max_date}'
                     """
                     cursor.execute(delete_query)
