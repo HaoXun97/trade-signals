@@ -61,9 +61,24 @@ def analyze_signals_from_db(
     signal_time = time.time() - signal_start
     print(f"訊號生成完成，耗時 {signal_time:.2f} 秒")
 
-    print("開始儲存結果到資料庫...")
+    # 根據輸入的資料表名稱決定要儲存到哪個 trade_signals 表
+    def _signals_table_for_data_table(data_table: str) -> str:
+        # 支援 schema.table 或 [schema].[table] 等格式
+        if not data_table:
+            return 'trade_signals'
+        base = data_table.split('.')[-1]
+        base = base.replace('[', '').replace(']', '')
+        if '_' in base:
+            suffix = base.split('_')[-1]
+            return f'trade_signals_{suffix}'
+        return 'trade_signals'
+
+    signals_table = _signals_table_for_data_table(table)
+    print(f"開始儲存結果到資料庫（目標表：{signals_table}）...")
     save_start = time.time()
-    dbmod.save_signals_to_mssql(df, server, database, user, password)
+    dbmod.save_signals_to_mssql(
+        df, server, database, user, password, table_name=signals_table
+    )
     save_time = time.time() - save_start
     print(f"資料庫儲存完成，耗時 {save_time:.2f} 秒")
 
@@ -223,8 +238,23 @@ def analyze_signals_from_db_with_symbol(
     signal_time = time.time() - signal_start
     print(f"訊號生成完成，耗時 {signal_time:.2f} 秒")
 
+    # 決定 trade_signals 表名，並儲存
+    def _signals_table_for_data_table(data_table: str) -> str:
+        if not data_table:
+            return 'trade_signals'
+        base = data_table.split('.')[-1]
+        base = base.replace('[', '').replace(']', '')
+        if '_' in base:
+            suffix = base.split('_')[-1]
+            return f'trade_signals_{suffix}'
+        return 'trade_signals'
+
+    signals_table = _signals_table_for_data_table(table)
     save_start = time.time()
-    dbmod.save_signals_to_mssql(df, server, database, user, password)
+    print(f"開始儲存結果到資料庫（目標表：{signals_table}）...")
+    dbmod.save_signals_to_mssql(
+        df, server, database, user, password, table_name=signals_table
+    )
     save_time = time.time() - save_start
 
     if output_path:
